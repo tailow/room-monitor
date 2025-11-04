@@ -6,10 +6,13 @@
     holding buffers for the duration of a data transfer."
 )]
 
-use esp_hal::clock::CpuClock;
-use esp_hal::main;
-use esp_hal::time::{Duration, Instant};
-use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{
+    clock::CpuClock,
+    gpio::{Io, Level, Output, OutputConfig},
+    main,
+    time::{Duration, Instant},
+    timer::timg::TimerGroup,
+};
 use esp_radio::ble::controller::BleConnector;
 use log::info;
 
@@ -26,8 +29,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[main]
 fn main() -> ! {
-    // generator version: 1.0.0
-
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -38,16 +39,23 @@ fn main() -> ! {
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
+
     esp_rtos::start(timg0.timer0);
+
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     let (mut _wifi_controller, _interfaces) =
         esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
     let _connector = BleConnector::new(&radio_init, peripherals.BT, Default::default());
 
+    // Set GPIO2 as an output, and set its state high initially.
+    let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
+
     loop {
-        info!("Hello world!");
+        led.toggle();
+
         let delay_start = Instant::now();
+
         while delay_start.elapsed() < Duration::from_millis(500) {}
     }
 
