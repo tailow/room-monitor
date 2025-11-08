@@ -363,6 +363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-dht-rs"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d29effeefb22e6d214e9ab294123ff3fe3578159679cde5591c82c272c8ae53f"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,6 +1309,7 @@ version = "0.1.0"
 dependencies = [
  "bleps",
  "critical-section",
+ "embedded-dht-rs",
  "embedded-io 0.7.1",
  "esp-alloc",
  "esp-bootloader-esp-idf",

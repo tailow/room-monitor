@@ -6,15 +6,16 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use embedded_dht_rs::dht11::Dht11;
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Io, Level, Output, OutputConfig},
+    delay::Delay,
+    gpio::{DriveMode, Level, Output, OutputConfig, Pull},
     main,
-    time::{Duration, Instant},
+    time::Duration,
     timer::timg::TimerGroup,
 };
 use esp_radio::ble::controller::BleConnector;
-use log::info;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -48,15 +49,34 @@ fn main() -> ! {
             .expect("Failed to initialize Wi-Fi controller");
     let _connector = BleConnector::new(&radio_init, peripherals.BT, Default::default());
 
-    // Set GPIO2 as an output, and set its state high initially.
-    let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
+    let delay = Delay::new();
+
+    let od_for_dht11 = Output::new(
+        peripherals.GPIO4,
+        Level::High,
+        OutputConfig::default()
+            .with_drive_mode(DriveMode::OpenDrain)
+            .with_pull(Pull::None),
+    )
+    .into_flex();
+
+    od_for_dht11.peripheral_input();
+
+    let mut dht11 = Dht11::new(od_for_dht11, delay);
 
     loop {
-        led.toggle();
+        delay.delay(Duration::from_millis(2000));
 
-        let delay_start = Instant::now();
-
-        while delay_start.elapsed() < Duration::from_millis(500) {}
+        match dht11.read() {
+            Ok(sensor_reading) => log::info!(
+                "DHT 11 Sensor - Temperature: {} °C, humidity: {} %",
+                sensor_reading.temperature,
+                sensor_reading.humidity
+            ),
+            Err(error) => {
+                log::error!("An error occurred while trying to read sensor: {:?}", error)
+            }
+        }
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples/src/bin
