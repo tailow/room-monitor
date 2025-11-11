@@ -15,6 +15,7 @@ use esp_hal::{
     time::Duration,
     timer::timg::TimerGroup,
 };
+use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
 
@@ -139,13 +140,10 @@ fn main() -> ! {
             let (integer, fraction) = onewire::ds18b20::split_temp(raw_temperature);
             let temperature = (integer as f32) + (fraction as f32) / 10000.0;
 
-            log::info!("DS18B20 - Temperature: {} °C", temperature);
-
             match dht11.read() {
-                Ok(sensor_reading) => log::info!(
-                    "DHT 11 - Temperature: {} °C, humidity: {} %",
-                    sensor_reading.temperature,
-                    sensor_reading.humidity
+                Ok(sensor_reading) => println!(
+                    "T1:{},T2:{:.4},H:{}",
+                    sensor_reading.temperature, temperature, sensor_reading.humidity
                 ),
                 Err(error) => {
                     log::error!("An error occurred while trying to read sensor: {:?}", error)
