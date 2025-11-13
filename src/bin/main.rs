@@ -6,6 +6,10 @@
     holding buffers for the duration of a data transfer."
 )]
 
+mod secrets;
+
+use alloc::string::String;
+use embassy_net::DhcpConfig;
 use embedded_dht_rs::dht11::Dht11;
 use esp_hal::{
     clock::CpuClock,
@@ -16,7 +20,7 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println::println;
-use esp_radio::ble::controller::BleConnector;
+use esp_radio::{ble::controller::BleConnector, wifi::ClientConfig};
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
 
 #[panic_handler]
@@ -26,8 +30,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 extern crate alloc;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[main]
@@ -36,6 +38,7 @@ fn main() -> ! {
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    let mut delay = Delay::new();
 
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
     // COEX needs more RAM - so we've added some more
@@ -51,7 +54,38 @@ fn main() -> ! {
             .expect("Failed to initialize Wi-Fi controller");
     let _connector = BleConnector::new(&radio_init, peripherals.BT, Default::default());
 
-    let mut delay = Delay::new();
+    let wifi_ssid = String::from(secrets::WIFI_SSID);
+    let wifi_password = String::from(secrets::WIFI_PASS);
+
+    let wifi_config = esp_radio::wifi::ModeConfig::Client(
+        ClientConfig::default()
+            .with_ssid(wifi_ssid)
+            .with_password(wifi_password),
+    );
+
+    _wifi_controller
+        .set_config(&wifi_config)
+        .expect("Couldn't set wifi config");
+
+    _wifi_controller
+        .start()
+        .expect("Coudln't start wifi controller");
+
+    _wifi_controller
+        .connect()
+        .expect("Couldn't connect to wifi");
+
+    loop {
+        if _wifi_controller.is_connected().expect("Error") {
+            break;
+        }
+
+        log::info!("Connecting to WiFi");
+
+        delay.delay(Duration::from_millis(500));
+    }
+
+    log::info!("WiFi connected");
 
     let od_for_dht11 = Output::new(
         peripherals.GPIO4,
@@ -67,7 +101,7 @@ fn main() -> ! {
     let mut dht11 = Dht11::new(od_for_dht11, delay);
 
     let mut onewire_pin = Output::new(
-        peripherals.GPIO16,
+        peripherals.GPIO25,
         Level::Low,
         OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
     )
@@ -119,14 +153,14 @@ fn main() -> ! {
         };
 
         'measure: loop {
-            let Ok(resolution) = sensor
+            let Ok(_) = sensor
                 .measure_temperature(&mut wire, &mut delay)
                 .inspect_err(|_| log::error!("Failed to start temperature measurement"))
             else {
                 continue 'measure;
             };
 
-            delay.delay(Duration::from_millis(resolution.time_ms() as u64));
+            delay.delay(Duration::from_millis(2000));
 
             // Retrieve the measured temperature from the sensor
             let Ok(raw_temperature) = sensor
