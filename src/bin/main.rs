@@ -41,14 +41,14 @@ use esp_rtos::main;
 
 use esp_println::println;
 
-use onewire::{self, DS18B20, DeviceSearch, OneWire, OpenDrainOutput, ds18b20};
+use onewire::{self, DS18B20, DeviceSearch, OneWire};
 
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
-    request::Method,
+    headers::ContentType,
+    request::{Method, RequestBuilder},
 };
 use static_cell::StaticCell;
-use time::{OffsetDateTime, UtcOffset};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -149,7 +149,7 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after_millis(500).await;
     }
 
-    let test_url = "https://io.adafruit.com/api/v2/time/seconds";
+    let timeserver_url = "https://io.adafruit.com/api/v2/time/seconds";
 
     let mut read_record_buffer = [0_u8; 16640];
     let mut write_record_buffer = [0_u8; 16640];
@@ -172,25 +172,27 @@ async fn main(spawner: Spawner) -> ! {
     log::info!("Create DNS socket");
     let dns_socket = DnsSocket::new(stack);
 
-    log::info!("Create HTTP client");
+    log::info!("Create HTTPS client");
     let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-    log::info!("Create HTTP request");
-    let mut request = http_client.request(Method::GET, test_url).await.unwrap();
+    log::info!("Send HTTPS request");
+    let time_response = http_client
+        .request(Method::GET, timeserver_url)
+        .await
+        .unwrap()
+        .send(&mut buffer)
+        .await
+        .unwrap()
+        .body()
+        .read_to_end()
+        .await
+        .unwrap();
 
-    log::info!("Send HTTP request");
-    let response = request.send(&mut buffer).await.unwrap();
+    let time_text = from_utf8(time_response).unwrap();
 
-    log::info!("Response status: {:?}", response.status);
+    log::info!("Received timestamp: {}", time_text);
 
-    let bytes = response.body().read_to_end().await.unwrap();
-    log::info!("Read {:?} bytes", bytes.len());
-
-    let text = from_utf8(bytes).unwrap();
-
-    log::info!("Received text: {}", text);
-
-    let init_unix_timestamp = text.parse::<u64>().unwrap();
+    let init_unix_timestamp = time_text.parse::<u64>().unwrap();
 
     let init_boot_secs = embassy_time::Instant::now().as_secs();
 
@@ -199,42 +201,76 @@ async fn main(spawner: Spawner) -> ! {
     'measure: loop {
         let Ok(_) = ds18b20
             .measure_temperature(&mut wire, &mut delay)
-            .inspect_err(|_| log::error!("Failed to start temperature measurement"))
+            .inspect_err(|_| log::error!("Failed to start DS18B20 temperature measurement"))
         else {
             continue 'measure;
         };
 
-        Timer::after_millis(2000).await;
-
-        // Retrieve the measured temperature from the sensor
-        let Ok(raw_temperature) = ds18b20
-            .read_temperature(&mut wire, &mut delay)
-            .inspect_err(|_| log::error!("Failed to read temperature"))
-        else {
-            continue 'measure;
-        };
-
-        // Process and log the temperature
-        let (integer, fraction) = onewire::ds18b20::split_temp(raw_temperature);
-        let temperature = (integer as f32) + (fraction as f32) / 10000.0;
+        Timer::after_secs(5).await;
 
         let current_timestamp = init_unix_timestamp + Instant::now().as_secs() - init_boot_secs;
 
-        let current_time = OffsetDateTime::from_unix_timestamp(current_timestamp as i64)
-            .unwrap()
-            .to_offset(UtcOffset::from_hms(2, 0, 0).unwrap());
+        if let Ok(ds18b20_reading) = ds18b20.read_temperature(&mut wire, &mut delay) {
+            let (integer, fraction) = onewire::ds18b20::split_temp(ds18b20_reading);
+            let ds18b20_temperature = (integer as f32) + (fraction as f32) / 10000.0;
 
-        log::info!("{}", current_time);
+            let ds18b20_data: String = alloc::format!(
+                "home,sensor=DS18B20 temp={} {}",
+                ds18b20_temperature,
+                current_timestamp,
+            );
 
-        match dht11.read() {
-            Ok(sensor_reading) => println!(
-                "T1:{},T2:{:.4},H:{}",
-                sensor_reading.temperature, temperature, sensor_reading.humidity
-            ),
-            Err(error) => {
-                log::error!("An error occurred while trying to read sensor: {:?}", error)
-            }
-        }
+            println!("Sending data: {}", ds18b20_data.clone());
+
+            let ds18b20_response = http_client
+                .request(Method::POST, secrets::INFLUX_HOST)
+                .await
+                .unwrap()
+                .body(ds18b20_data.as_bytes())
+                .headers(&[
+                    ("Authorization", secrets::INFLUX_TOKEN),
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Accept", "application/json"),
+                ])
+                .send(&mut buffer)
+                .await
+                .unwrap()
+                .status;
+
+            println!("Response status: {:?}", ds18b20_response);
+        } else {
+            log::error!("Failed to read DS18B20 sensor");
+        };
+
+        if let Ok(dht11_reading) = dht11.read() {
+            let dht11_data: String = alloc::format!(
+                "home,sensor=DHT11 temp={},hum={} {}",
+                dht11_reading.temperature,
+                dht11_reading.humidity,
+                current_timestamp
+            );
+
+            println!("Sending data: {}", dht11_data);
+
+            let ds18b20_response = http_client
+                .request(Method::POST, secrets::INFLUX_HOST)
+                .await
+                .unwrap()
+                .body(dht11_data.as_bytes())
+                .headers(&[
+                    ("Authorization", secrets::INFLUX_TOKEN),
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Accept", "application/json"),
+                ])
+                .send(&mut buffer)
+                .await
+                .unwrap()
+                .status;
+
+            println!("Response status: {:?}", ds18b20_response);
+        } else {
+            log::error!("Failed to read DHT11 sensor");
+        };
     }
 }
 
