@@ -21,14 +21,14 @@ use embassy_net::{
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
-use embassy_time::{Duration, Timer};
+use embassy_time::{Instant, Timer};
 
 use embedded_dht_rs::dht11::Dht11;
 
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    gpio::{DriveMode, Level, Output, OutputConfig, Pull},
+    gpio::{DriveMode, Flex, Level, Output, OutputConfig, Pull},
     rng::Rng,
     timer::timg::TimerGroup,
 };
@@ -41,13 +41,14 @@ use esp_rtos::main;
 
 use esp_println::println;
 
-use onewire::{self, DS18B20, DeviceSearch, OneWire};
+use onewire::{self, DS18B20, DeviceSearch, OneWire, OpenDrainOutput, ds18b20};
 
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
     request::Method,
 };
 use static_cell::StaticCell;
+use time::{OffsetDateTime, UtcOffset};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -60,6 +61,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 static STACK_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
 static WIFI_CONTROLLER: StaticCell<Controller<'static>> = StaticCell::new();
+
 pub static STOP_WIFI_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[main]
@@ -76,6 +78,34 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_rtos::start(timg0.timer0);
 
+    // INIT SENSORS
+    let dht11_pin = Output::new(
+        peripherals.GPIO4,
+        Level::High,
+        OutputConfig::default()
+            .with_drive_mode(DriveMode::OpenDrain)
+            .with_pull(Pull::None),
+    )
+    .into_flex();
+
+    dht11_pin.peripheral_input();
+
+    let mut dht11 = Dht11::new(dht11_pin, delay);
+
+    let mut onewire_pin = Output::new(
+        peripherals.GPIO25,
+        Level::Low,
+        OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
+    )
+    .into_flex();
+
+    onewire_pin.set_input_enable(true);
+
+    let mut wire = OneWire::new(onewire_pin, false);
+
+    let ds18b20 = find_ds18b20(&mut wire, &mut delay).await;
+
+    // INIT WIFI
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     let radio_init: &'static mut _ = WIFI_CONTROLLER.init(radio_init);
 
@@ -160,101 +190,49 @@ async fn main(spawner: Spawner) -> ! {
 
     log::info!("Received text: {}", text);
 
-    let dht11_pin = Output::new(
-        peripherals.GPIO4,
-        Level::High,
-        OutputConfig::default()
-            .with_drive_mode(DriveMode::OpenDrain)
-            .with_pull(Pull::None),
-    )
-    .into_flex();
+    let init_unix_timestamp = text.parse::<u64>().unwrap();
 
-    dht11_pin.peripheral_input();
+    let init_boot_secs = embassy_time::Instant::now().as_secs();
 
-    let mut dht11 = Dht11::new(dht11_pin, delay);
+    log::info!("Seconds from boot: {}", init_boot_secs);
 
-    let mut onewire_pin = Output::new(
-        peripherals.GPIO25,
-        Level::Low,
-        OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
-    )
-    .into_flex();
-
-    onewire_pin.set_input_enable(true);
-
-    let mut wire = OneWire::new(onewire_pin, false);
-
-    let mut first_iteration = true;
-
-    'infinite: loop {
-        // Just a little trick to prevent spam, in case we need to restart this loop
-        if !first_iteration {
-            Timer::after_millis(1000).await;
-        } else {
-            first_iteration = false;
-        }
-
-        // Reset to test if wire is okay and if any sensor is connected
-        if wire
-            .reset(&mut delay)
-            .inspect_err(|_| log::error!("Failed to reset wire"))
-            .is_err()
-        {
-            continue 'infinite;
-        }
-
-        // Start searching for a sensor (we just care to get the first one)
-        let mut search = DeviceSearch::new();
-        let Ok(device) = wire
-            .search_next(&mut search, &mut delay)
-            .inspect_err(|_| log::error!("Failed to search for temperature sensor"))
+    'measure: loop {
+        let Ok(_) = ds18b20
+            .measure_temperature(&mut wire, &mut delay)
+            .inspect_err(|_| log::error!("Failed to start temperature measurement"))
         else {
-            continue;
-        };
-        let Some(device) = device else {
-            log::info!("No temperature sensor found");
-            continue;
+            continue 'measure;
         };
 
-        log::info!("Found temperature sensor: {:?}", device);
+        Timer::after_millis(2000).await;
 
-        // Construct the sensor driver
-        let Ok(sensor) = DS18B20::new(device)
-            .inspect_err(|_| log::error!("Failed to create temperature sensor"))
+        // Retrieve the measured temperature from the sensor
+        let Ok(raw_temperature) = ds18b20
+            .read_temperature(&mut wire, &mut delay)
+            .inspect_err(|_| log::error!("Failed to read temperature"))
         else {
-            continue;
+            continue 'measure;
         };
 
-        'measure: loop {
-            let Ok(_) = sensor
-                .measure_temperature(&mut wire, &mut delay)
-                .inspect_err(|_| log::error!("Failed to start temperature measurement"))
-            else {
-                continue 'measure;
-            };
+        // Process and log the temperature
+        let (integer, fraction) = onewire::ds18b20::split_temp(raw_temperature);
+        let temperature = (integer as f32) + (fraction as f32) / 10000.0;
 
-            Timer::after_millis(2000).await;
+        let current_timestamp = init_unix_timestamp + Instant::now().as_secs() - init_boot_secs;
 
-            // Retrieve the measured temperature from the sensor
-            let Ok(raw_temperature) = sensor
-                .read_temperature(&mut wire, &mut delay)
-                .inspect_err(|_| log::error!("Failed to read temperature"))
-            else {
-                continue 'measure;
-            };
+        let current_time = OffsetDateTime::from_unix_timestamp(current_timestamp as i64)
+            .unwrap()
+            .to_offset(UtcOffset::from_hms(2, 0, 0).unwrap());
 
-            // Process and log the temperature
-            let (integer, fraction) = onewire::ds18b20::split_temp(raw_temperature);
-            let temperature = (integer as f32) + (fraction as f32) / 10000.0;
+        log::info!("{}", current_time);
 
-            match dht11.read() {
-                Ok(sensor_reading) => println!(
-                    "T1:{},T2:{:.4},H:{}",
-                    sensor_reading.temperature, temperature, sensor_reading.humidity
-                ),
-                Err(error) => {
-                    log::error!("An error occurred while trying to read sensor: {:?}", error)
-                }
+        match dht11.read() {
+            Ok(sensor_reading) => println!(
+                "T1:{},T2:{:.4},H:{}",
+                sensor_reading.temperature, temperature, sensor_reading.humidity
+            ),
+            Err(error) => {
+                log::error!("An error occurred while trying to read sensor: {:?}", error)
             }
         }
     }
@@ -346,4 +324,50 @@ fn random_64() -> u64 {
     let [e, f, g, h] = rng.random().to_ne_bytes();
 
     u64::from_ne_bytes([a, b, c, d, e, f, g, h])
+}
+
+async fn find_ds18b20(wire: &mut OneWire<Flex<'_>>, mut delay: &mut Delay) -> DS18B20 {
+    let mut first_iteration = true;
+
+    'infinite: loop {
+        // Just a little trick to prevent spam, in case we need to restart this loop
+        if !first_iteration {
+            Timer::after_millis(1000).await;
+        } else {
+            first_iteration = false;
+        }
+
+        // Reset to test if wire is okay and if any sensor is connected
+        if wire
+            .reset(&mut delay)
+            .inspect_err(|_| log::error!("Failed to reset wire"))
+            .is_err()
+        {
+            continue 'infinite;
+        }
+
+        // Start searching for a sensor (we just care to get the first one)
+        let mut search = DeviceSearch::new();
+        let Ok(device) = wire
+            .search_next(&mut search, &mut delay)
+            .inspect_err(|_| log::error!("Failed to search for temperature sensor"))
+        else {
+            continue;
+        };
+        let Some(device) = device else {
+            log::info!("No temperature sensor found");
+            continue;
+        };
+
+        log::info!("Found temperature sensor: {:?}", device);
+
+        // Construct the sensor driver
+        let Ok(sensor) = DS18B20::new(device)
+            .inspect_err(|_| log::error!("Failed to create temperature sensor"))
+        else {
+            continue;
+        };
+
+        return sensor;
+    }
 }
