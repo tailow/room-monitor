@@ -9,19 +9,35 @@
 mod secrets;
 
 use alloc::string::String;
-use embassy_net::DhcpConfig;
+use embassy_executor::Spawner;
+
+use embassy_net::{Runner, StackResources};
+
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+
+use embassy_time::{Duration, Timer};
+
 use embedded_dht_rs::dht11::Dht11;
+
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     gpio::{DriveMode, Level, Output, OutputConfig, Pull},
-    main,
-    time::Duration,
+    rng::Rng,
     timer::timg::TimerGroup,
 };
+
+use esp_radio::{
+    Controller,
+    wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice, WifiError, WifiEvent},
+};
+use esp_rtos::main;
+
 use esp_println::println;
-use esp_radio::{ble::controller::BleConnector, wifi::ClientConfig};
+
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
+
+use static_cell::StaticCell;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -32,8 +48,12 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+static STACK_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
+static WIFI_CONTROLLER: StaticCell<Controller<'static>> = StaticCell::new();
+pub static STOP_WIFI_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 #[main]
-fn main() -> ! {
+async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -49,45 +69,51 @@ fn main() -> ! {
     esp_rtos::start(timg0.timer0);
 
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
+    let radio_init: &'static mut _ = WIFI_CONTROLLER.init(radio_init);
+
+    let (wifi_controller, interfaces) =
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
-    let _connector = BleConnector::new(&radio_init, peripherals.BT, Default::default());
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    let stack_resources: &'static mut _ = STACK_RESOURCES.init(StackResources::new());
+
+    let (stack, runner) = embassy_net::new(
+        interfaces.sta,
+        config,
+        stack_resources,
+        Rng::new().random() as u64,
+    );
 
     let wifi_ssid = String::from(secrets::WIFI_SSID);
     let wifi_password = String::from(secrets::WIFI_PASS);
 
-    let wifi_config = esp_radio::wifi::ModeConfig::Client(
-        ClientConfig::default()
-            .with_ssid(wifi_ssid)
-            .with_password(wifi_password),
-    );
-
-    _wifi_controller
-        .set_config(&wifi_config)
-        .expect("Couldn't set wifi config");
-
-    _wifi_controller
-        .start()
-        .expect("Coudln't start wifi controller");
-
-    _wifi_controller
-        .connect()
-        .expect("Couldn't connect to wifi");
+    spawner.must_spawn(connection(wifi_controller, wifi_ssid, wifi_password));
+    spawner.must_spawn(net_task(runner));
 
     loop {
-        if _wifi_controller.is_connected().expect("Error") {
+        if stack.is_link_up() {
             break;
         }
 
-        log::info!("Connecting to WiFi");
+        log::info!("Wait for network link");
 
-        delay.delay(Duration::from_millis(500));
+        Timer::after_millis(500).await;
     }
 
-    log::info!("WiFi connected");
+    log::info!("Wait for IP address");
 
-    let od_for_dht11 = Output::new(
+    loop {
+        if let Some(config) = stack.config_v4() {
+            log::info!("Connected to WiFi with IP address {}", config.address);
+
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    let dht11_pin = Output::new(
         peripherals.GPIO4,
         Level::High,
         OutputConfig::default()
@@ -96,9 +122,9 @@ fn main() -> ! {
     )
     .into_flex();
 
-    od_for_dht11.peripheral_input();
+    dht11_pin.peripheral_input();
 
-    let mut dht11 = Dht11::new(od_for_dht11, delay);
+    let mut dht11 = Dht11::new(dht11_pin, delay);
 
     let mut onewire_pin = Output::new(
         peripherals.GPIO25,
@@ -116,7 +142,7 @@ fn main() -> ! {
     'infinite: loop {
         // Just a little trick to prevent spam, in case we need to restart this loop
         if !first_iteration {
-            delay.delay(Duration::from_secs(1)); // Prevent spam
+            Timer::after_millis(1000).await;
         } else {
             first_iteration = false;
         }
@@ -160,7 +186,7 @@ fn main() -> ! {
                 continue 'measure;
             };
 
-            delay.delay(Duration::from_millis(2000));
+            Timer::after_millis(2000).await;
 
             // Retrieve the measured temperature from the sensor
             let Ok(raw_temperature) = sensor
@@ -184,5 +210,97 @@ fn main() -> ! {
                 }
             }
         }
+    }
+}
+
+/// Task for WiFi connection
+///
+/// This will wrap [`connection_fallible()`] and trap any error.
+#[embassy_executor::task]
+async fn connection(controller: WifiController<'static>, ssid: String, password: String) {
+    if let Err(error) = connection_fallible(controller, ssid, password).await {
+        log::error!("Cannot connect to WiFi: {error:?}");
+    }
+}
+
+/// Fallible task for WiFi connection
+async fn connection_fallible(
+    mut controller: WifiController<'static>,
+    ssid: String,
+    password: String,
+) -> Result<(), Error> {
+    log::info!("Start connection");
+    log::info!("Device capabilities: {:?}", controller.capabilities());
+
+    loop {
+        if controller.is_connected().expect("Connection check error") {
+            // wait until we're no longer connected
+            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+
+            Timer::after(Duration::from_millis(5000)).await;
+        }
+
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = ModeConfig::Client(
+                ClientConfig::default()
+                    .with_ssid(ssid.clone())
+                    .with_password(password.clone()),
+            );
+
+            controller
+                .set_config(&client_config)
+                .expect("Failed to set config");
+
+            log::info!("Starting WiFi controller");
+
+            controller.start_async().await?;
+
+            log::info!("WiFi controller started");
+        }
+
+        log::info!("Connect to WiFi network");
+
+        match controller.connect_async().await {
+            Ok(()) => {
+                log::info!("Connected to WiFi network");
+
+                log::info!("Wait for request to stop wifi");
+
+                STOP_WIFI_SIGNAL.wait().await;
+
+                log::info!("Received signal to stop wifi");
+
+                controller.stop_async().await?;
+                break;
+            }
+            Err(error) => {
+                log::error!("Failed to connect to WiFi network: {error:?}");
+
+                Timer::after(Duration::from_millis(5000)).await;
+            }
+        }
+    }
+
+    log::info!("Leave connection task");
+
+    Ok(())
+}
+
+/// Task for ongoing network processing
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await;
+}
+
+/// Error within WiFi connection
+#[derive(Debug)]
+pub enum Error {
+    /// Error during WiFi operation
+    Wifi(#[expect(unused, reason = "Never read directly")] WifiError),
+}
+
+impl From<WifiError> for Error {
+    fn from(error: WifiError) -> Self {
+        Self::Wifi(error)
     }
 }

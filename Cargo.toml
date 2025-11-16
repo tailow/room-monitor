@@ -10,28 +10,17 @@ path = "./src/bin/main.rs"
 
 [dependencies]
 esp-hal = { version = "1.0.0", features = ["esp32", "log-04", "unstable"] }
-
 esp-rtos = { version = "0.2.0", features = [
+  "embassy",
   "esp-alloc",
   "esp-radio",
   "esp32",
   "log-04",
 ] }
-
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32", "log-04"] }
-log = "0.4.27"
-
-bleps = { git = "https://github.com/bjoernQ/bleps", package = "bleps", rev = "a5148d8ae679e021b78f53fd33afb8bb35d0b62e", features = [
-  "async",
-  "macros",
-] }
-critical-section = "1.2.0"
-embedded-io = "0.7.1"
 esp-alloc = "0.9.0"
 esp-println = { version = "0.16.1", features = ["esp32", "log-04"] }
 esp-radio = { version = "0.17.0", features = [
-  "ble",
-  "coex",
   "esp-alloc",
   "esp32",
   "log-04",
@@ -39,6 +28,18 @@ esp-radio = { version = "0.17.0", features = [
   "unstable",
   "wifi",
 ] }
+
+log = "0.4.27"
+
+bleps = { git = "https://github.com/bjoernQ/bleps", package = "bleps", rev = "a5148d8ae679e021b78f53fd33afb8bb35d0b62e", features = [
+  "async",
+  "macros",
+] }
+
+critical-section = "1.2.0"
+
+embedded-io = "0.7.1"
+
 smoltcp = { version = "0.12.0", default-features = false, features = [
   "log",
   "medium-ethernet",
@@ -52,11 +53,21 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
-embedded-dht-rs = { version = "0.5.0", features = ["dht11"] }
-onewire = "0.4.0"
-defmt = "1.0.1"
-embassy-net = { version = "0.7.1", features = ["tcp", "dhcpv4"] }
 
+embassy-executor = "0.9.1"
+embassy-sync = "0.7.2"
+embassy-time = "0.5.0"
+embassy-net = { version = "0.7.1", features = ["tcp", "dhcpv4", "dns"] }
+
+reqwless = "0.13.0"
+
+static_cell = "2.1.1"
+
+defmt = "1.0.1"
+
+onewire = "0.4.0"
+
+embedded-dht-rs = { version = "0.5.0", features = ["dht11"] }
 
 [profile.dev]
 # Rust debug is too slow.
