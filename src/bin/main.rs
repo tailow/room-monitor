@@ -8,10 +8,16 @@
 
 mod secrets;
 
+use core::str::from_utf8;
+
 use alloc::string::String;
 use embassy_executor::Spawner;
 
-use embassy_net::{Runner, StackResources};
+use embassy_net::{
+    Runner, StackResources,
+    dns::DnsSocket,
+    tcp::client::{TcpClient, TcpClientState},
+};
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
@@ -37,6 +43,10 @@ use esp_println::println;
 
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
 
+use reqwless::{
+    client::{HttpClient, TlsConfig, TlsVerify},
+    request::Method,
+};
 use static_cell::StaticCell;
 
 #[panic_handler]
@@ -61,8 +71,6 @@ async fn main(spawner: Spawner) -> ! {
     let mut delay = Delay::new();
 
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
-    // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
 
@@ -79,12 +87,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let stack_resources: &'static mut _ = STACK_RESOURCES.init(StackResources::new());
 
-    let (stack, runner) = embassy_net::new(
-        interfaces.sta,
-        config,
-        stack_resources,
-        Rng::new().random() as u64,
-    );
+    let (stack, runner) = embassy_net::new(interfaces.sta, config, stack_resources, random_64());
 
     let wifi_ssid = String::from(secrets::WIFI_SSID);
     let wifi_password = String::from(secrets::WIFI_PASS);
@@ -92,12 +95,14 @@ async fn main(spawner: Spawner) -> ! {
     spawner.must_spawn(connection(wifi_controller, wifi_ssid, wifi_password));
     spawner.must_spawn(net_task(runner));
 
+    log::info!("Wait for network link");
+
     loop {
         if stack.is_link_up() {
+            log::info!("Network link up");
+
             break;
         }
-
-        log::info!("Wait for network link");
 
         Timer::after_millis(500).await;
     }
@@ -110,8 +115,50 @@ async fn main(spawner: Spawner) -> ! {
 
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+
+        Timer::after_millis(500).await;
     }
+
+    let test_url = "https://io.adafruit.com/api/v2/time/seconds";
+
+    let mut read_record_buffer = [0_u8; 16640];
+    let mut write_record_buffer = [0_u8; 16640];
+
+    let seed = random_64();
+
+    let tls_config = TlsConfig::new(
+        seed,
+        &mut read_record_buffer,
+        &mut write_record_buffer,
+        TlsVerify::None,
+    );
+
+    let mut buffer = [0_u8; 4096];
+
+    log::info!("Create TCP client");
+    let tcp_state = TcpClientState::<1, 4096, 4096>::new();
+    let tcp_client = TcpClient::new(stack, &tcp_state);
+
+    log::info!("Create DNS socket");
+    let dns_socket = DnsSocket::new(stack);
+
+    log::info!("Create HTTP client");
+    let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+
+    log::info!("Create HTTP request");
+    let mut request = http_client.request(Method::GET, test_url).await.unwrap();
+
+    log::info!("Send HTTP request");
+    let response = request.send(&mut buffer).await.unwrap();
+
+    log::info!("Response status: {:?}", response.status);
+
+    let bytes = response.body().read_to_end().await.unwrap();
+    log::info!("Read {:?} bytes", bytes.len());
+
+    let text = from_utf8(bytes).unwrap();
+
+    log::info!("Received text: {}", text);
 
     let dht11_pin = Output::new(
         peripherals.GPIO4,
@@ -228,7 +275,7 @@ async fn connection_fallible(
     mut controller: WifiController<'static>,
     ssid: String,
     password: String,
-) -> Result<(), Error> {
+) -> Result<(), WifiError> {
     log::info!("Start connection");
     log::info!("Device capabilities: {:?}", controller.capabilities());
 
@@ -237,7 +284,7 @@ async fn connection_fallible(
             // wait until we're no longer connected
             controller.wait_for_event(WifiEvent::StaDisconnected).await;
 
-            Timer::after(Duration::from_millis(5000)).await;
+            Timer::after_millis(5000).await;
         }
 
         if !matches!(controller.is_started(), Ok(true)) {
@@ -276,7 +323,7 @@ async fn connection_fallible(
             Err(error) => {
                 log::error!("Failed to connect to WiFi network: {error:?}");
 
-                Timer::after(Duration::from_millis(5000)).await;
+                Timer::after_millis(5000).await;
             }
         }
     }
@@ -292,15 +339,11 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await;
 }
 
-/// Error within WiFi connection
-#[derive(Debug)]
-pub enum Error {
-    /// Error during WiFi operation
-    Wifi(#[expect(unused, reason = "Never read directly")] WifiError),
-}
+fn random_64() -> u64 {
+    let rng = Rng::new();
 
-impl From<WifiError> for Error {
-    fn from(error: WifiError) -> Self {
-        Self::Wifi(error)
-    }
+    let [a, b, c, d] = rng.random().to_ne_bytes();
+    let [e, f, g, h] = rng.random().to_ne_bytes();
+
+    u64::from_ne_bytes([a, b, c, d, e, f, g, h])
 }

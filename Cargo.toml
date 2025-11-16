@@ -59,7 +59,7 @@ embassy-sync = "0.7.2"
 embassy-time = "0.5.0"
 embassy-net = { version = "0.7.1", features = ["tcp", "dhcpv4", "dns"] }
 
-reqwless = "0.13.0"
+reqwless = { version = "0.13.0", features = ["alloc", "embedded-tls"] }
 
 static_cell = "2.1.1"
 
