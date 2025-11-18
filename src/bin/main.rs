@@ -21,7 +21,7 @@ use embassy_net::{
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use embedded_dht_rs::dht11::Dht11;
 
@@ -39,13 +39,10 @@ use esp_radio::{
 };
 use esp_rtos::main;
 
-use esp_println::println;
-
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
 
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
-    headers::ContentType,
     request::{Method, RequestBuilder},
 };
 use static_cell::StaticCell;
@@ -66,211 +63,289 @@ pub static STOP_WIFI_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new()
 
 #[main]
 async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
-
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-    let mut delay = Delay::new();
-
-    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
-
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-
-    esp_rtos::start(timg0.timer0);
-
-    // INIT SENSORS
-    let dht11_pin = Output::new(
-        peripherals.GPIO4,
-        Level::High,
-        OutputConfig::default()
-            .with_drive_mode(DriveMode::OpenDrain)
-            .with_pull(Pull::None),
-    )
-    .into_flex();
-
-    dht11_pin.peripheral_input();
-
-    let mut dht11 = Dht11::new(dht11_pin, delay);
-
-    let mut onewire_pin = Output::new(
-        peripherals.GPIO25,
-        Level::Low,
-        OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
-    )
-    .into_flex();
-
-    onewire_pin.set_input_enable(true);
-
-    let mut wire = OneWire::new(onewire_pin, false);
-
-    let ds18b20 = find_ds18b20(&mut wire, &mut delay).await;
-
-    // INIT WIFI
-    let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    let radio_init: &'static mut _ = WIFI_CONTROLLER.init(radio_init);
-
-    let (wifi_controller, interfaces) =
-        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-
-    let config = embassy_net::Config::dhcpv4(Default::default());
-
-    let stack_resources: &'static mut _ = STACK_RESOURCES.init(StackResources::new());
-
-    let (stack, runner) = embassy_net::new(interfaces.sta, config, stack_resources, random_64());
-
-    let wifi_ssid = String::from(secrets::WIFI_SSID);
-    let wifi_password = String::from(secrets::WIFI_PASS);
-
-    spawner.must_spawn(connection(wifi_controller, wifi_ssid, wifi_password));
-    spawner.must_spawn(net_task(runner));
-
-    log::info!("Wait for network link");
-
     loop {
-        if stack.is_link_up() {
-            log::info!("Network link up");
+        esp_println::logger::init_logger_from_env();
 
-            break;
-        }
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let peripherals = esp_hal::init(config);
+        let mut delay = Delay::new();
 
-        Timer::after_millis(500).await;
-    }
+        esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
 
-    log::info!("Wait for IP address");
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
 
-    loop {
-        if let Some(config) = stack.config_v4() {
-            log::info!("Connected to WiFi with IP address {}", config.address);
+        esp_rtos::start(timg0.timer0);
 
-            break;
-        }
+        let mut internal_led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
 
-        Timer::after_millis(500).await;
-    }
+        // INIT SENSORS
+        let dht11_pin = Output::new(
+            peripherals.GPIO4,
+            Level::High,
+            OutputConfig::default()
+                .with_drive_mode(DriveMode::OpenDrain)
+                .with_pull(Pull::None),
+        )
+        .into_flex();
 
-    let timeserver_url = "https://io.adafruit.com/api/v2/time/seconds";
+        dht11_pin.peripheral_input();
 
-    let mut read_record_buffer = [0_u8; 16640];
-    let mut write_record_buffer = [0_u8; 16640];
+        let mut dht11 = Dht11::new(dht11_pin, delay);
 
-    let seed = random_64();
+        let mut onewire_pin = Output::new(
+            peripherals.GPIO25,
+            Level::Low,
+            OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
+        )
+        .into_flex();
 
-    let tls_config = TlsConfig::new(
-        seed,
-        &mut read_record_buffer,
-        &mut write_record_buffer,
-        TlsVerify::None,
-    );
+        onewire_pin.set_input_enable(true);
 
-    let mut buffer = [0_u8; 4096];
+        let mut wire = OneWire::new(onewire_pin, false);
 
-    log::info!("Create TCP client");
-    let tcp_state = TcpClientState::<1, 4096, 4096>::new();
-    let tcp_client = TcpClient::new(stack, &tcp_state);
+        let ds18b20 = find_ds18b20(&mut wire, &mut delay).await;
 
-    log::info!("Create DNS socket");
-    let dns_socket = DnsSocket::new(stack);
+        // INIT WIFI
+        let radio_init = match esp_radio::init() {
+            Ok(radio) => radio,
+            Err(e) => {
+                log::error!("Error initializing radio: {}", e);
 
-    log::info!("Create HTTPS client");
-    let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+                Timer::after_millis(500).await;
 
-    log::info!("Send HTTPS request");
-    let time_response = http_client
-        .request(Method::GET, timeserver_url)
-        .await
-        .unwrap()
-        .send(&mut buffer)
-        .await
-        .unwrap()
-        .body()
-        .read_to_end()
-        .await
-        .unwrap();
+                continue;
+            }
+        };
 
-    let time_text = from_utf8(time_response).unwrap();
+        let radio_init: &'static mut _ = WIFI_CONTROLLER.init(radio_init);
 
-    log::info!("Received timestamp: {}", time_text);
-
-    let init_unix_timestamp = time_text.parse::<u64>().unwrap();
-
-    let init_boot_secs = embassy_time::Instant::now().as_secs();
-
-    log::info!("Seconds from boot: {}", init_boot_secs);
-
-    'measure: loop {
-        let Ok(_) = ds18b20
-            .measure_temperature(&mut wire, &mut delay)
-            .inspect_err(|_| log::error!("Failed to start DS18B20 temperature measurement"))
+        let Ok((wifi_controller, interfaces)) =
+            esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
+                .inspect_err(|e| log::error!("Failed to initialize WiFi controller: {}", e))
         else {
-            continue 'measure;
+            Timer::after_millis(500).await;
+
+            continue;
         };
 
-        Timer::after_secs(5).await;
+        let net_config = embassy_net::Config::dhcpv4(Default::default());
 
-        let current_timestamp = init_unix_timestamp + Instant::now().as_secs() - init_boot_secs;
+        let stack_resources: &'static mut _ = STACK_RESOURCES.init(StackResources::new());
 
-        if let Ok(ds18b20_reading) = ds18b20.read_temperature(&mut wire, &mut delay) {
-            let (integer, fraction) = onewire::ds18b20::split_temp(ds18b20_reading);
-            let ds18b20_temperature = (integer as f32) + (fraction as f32) / 10000.0;
+        let (stack, runner) =
+            embassy_net::new(interfaces.sta, net_config, stack_resources, random_64());
 
-            let ds18b20_data: String = alloc::format!(
-                "home,sensor=DS18B20 temp={} {}",
-                ds18b20_temperature,
-                current_timestamp,
+        let wifi_ssid = String::from(secrets::WIFI_SSID);
+        let wifi_password = String::from(secrets::WIFI_PASS);
+
+        spawner.must_spawn(connection(wifi_controller, wifi_ssid, wifi_password));
+        spawner.must_spawn(net_task(runner));
+
+        log::info!("Wait for network link");
+
+        loop {
+            if stack.is_link_up() {
+                log::info!("Network link up");
+
+                break;
+            }
+
+            Timer::after_millis(500).await;
+        }
+
+        log::info!("Wait for IP address");
+
+        loop {
+            if let Some(config) = stack.config_v4() {
+                log::info!("Connected to WiFi with IP address {}", config.address);
+
+                break;
+            }
+
+            Timer::after_millis(500).await;
+        }
+
+        log::info!("Create TCP client");
+        let tcp_state = TcpClientState::<1, 4096, 4096>::new();
+        let mut tcp_client = TcpClient::new(stack, &tcp_state);
+
+        tcp_client.set_timeout(Some(Duration::from_secs(5)));
+
+        log::info!("Create DNS socket");
+        let dns_socket = DnsSocket::new(stack);
+
+        let timeserver_url = "https://io.adafruit.com/api/v2/time/seconds";
+
+        let mut read_record_buffer = [0_u8; 16640];
+        let mut write_record_buffer = [0_u8; 16640];
+
+        let mut request_buffer = [0_u8; 4096];
+
+        let seed = random_64();
+
+        let tls_config = TlsConfig::new(
+            seed,
+            &mut read_record_buffer,
+            &mut write_record_buffer,
+            TlsVerify::None,
+        );
+
+        log::info!("Create HTTP client");
+        let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+
+        log::info!("Create HTTP request");
+        let Ok(mut time_request) = http_client
+            .request(Method::GET, timeserver_url)
+            .await
+            .inspect_err(|e| log::error!("Failed to create HTTP request: {:?}", e))
+        else {
+            Timer::after_millis(500).await;
+
+            continue;
+        };
+
+        log::info!("Send HTTP request");
+        let Ok(time_response) = time_request
+            .send(&mut request_buffer)
+            .await
+            .inspect_err(|e| log::error!("Failed to send HTTP request: {:?}", e))
+        else {
+            Timer::after_millis(500).await;
+
+            continue;
+        };
+
+        let Ok(time_data) = time_response
+            .body()
+            .read_to_end()
+            .await
+            .inspect_err(|e| log::error!("Error reading response data: {:?}", e))
+        else {
+            Timer::after_millis(500).await;
+
+            continue;
+        };
+
+        drop(time_request);
+
+        let Ok(time_text) =
+            from_utf8(time_data).inspect_err(|e| log::error!("Error parsing time data: {:?}", e))
+        else {
+            Timer::after_millis(500).await;
+
+            continue;
+        };
+
+        log::info!("Received timestamp: {}", time_text);
+
+        let Ok(init_unix_timestamp) = time_text
+            .parse::<u64>()
+            .inspect_err(|e| log::error!("Error parsing Unix timestamp: {:?}", e))
+        else {
+            Timer::after_millis(500).await;
+
+            continue;
+        };
+
+        let init_boot_secs = embassy_time::Instant::now().as_secs();
+
+        log::info!("Seconds from boot: {}", init_boot_secs);
+
+        internal_led.set_high();
+
+        'measure: loop {
+            let Ok(_) = ds18b20
+                .measure_temperature(&mut wire, &mut delay)
+                .inspect_err(|_| log::error!("Failed to start DS18B20 temperature measurement"))
+            else {
+                Timer::after_millis(500).await;
+
+                continue 'measure;
+            };
+
+            Timer::after_secs(10).await;
+
+            let current_timestamp = init_unix_timestamp + Instant::now().as_secs() - init_boot_secs;
+
+            let mut data = String::new();
+
+            if let Ok(ds18b20_reading) = ds18b20.read_temperature(&mut wire, &mut delay) {
+                let (integer, fraction) = onewire::ds18b20::split_temp(ds18b20_reading);
+                let ds18b20_temperature = (integer as f32) + (fraction as f32) / 10000.0;
+
+                data.push_str(
+                    alloc::format!(
+                        "home,sensor=DS18B20 temp={} {}\n",
+                        ds18b20_temperature,
+                        current_timestamp,
+                    )
+                    .as_str(),
+                );
+            } else {
+                log::error!("Failed to read DS18B20 sensor");
+            };
+
+            if let Ok(dht11_reading) = dht11.read() {
+                data.push_str(
+                    alloc::format!(
+                        "home,sensor=DHT11 temp={},hum={} {}\n",
+                        dht11_reading.temperature,
+                        dht11_reading.humidity,
+                        current_timestamp
+                    )
+                    .as_str(),
+                );
+            } else {
+                log::error!("Failed to read DHT11 sensor");
+            };
+
+            log::info!("Sending data:\n{}", data.trim_end());
+
+            read_record_buffer = [0_u8; 16640];
+            write_record_buffer = [0_u8; 16640];
+
+            request_buffer = [0_u8; 4096];
+
+            let seed = random_64();
+
+            let tls_config = TlsConfig::new(
+                seed,
+                &mut read_record_buffer,
+                &mut write_record_buffer,
+                TlsVerify::None,
             );
 
-            println!("Sending data: {}", ds18b20_data.clone());
+            log::info!("Create HTTP client");
+            let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-            let ds18b20_response = http_client
+            log::info!("Creating HTTP request");
+
+            match http_client
                 .request(Method::POST, secrets::INFLUX_HOST)
                 .await
-                .unwrap()
-                .body(ds18b20_data.as_bytes())
-                .headers(&[
-                    ("Authorization", secrets::INFLUX_TOKEN),
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                    ("Accept", "application/json"),
-                ])
-                .send(&mut buffer)
-                .await
-                .unwrap()
-                .status;
+            {
+                Ok(request) => {
+                    log::info!("Sending HTTP request");
 
-            println!("Response status: {:?}", ds18b20_response);
-        } else {
-            log::error!("Failed to read DS18B20 sensor");
-        };
-
-        if let Ok(dht11_reading) = dht11.read() {
-            let dht11_data: String = alloc::format!(
-                "home,sensor=DHT11 temp={},hum={} {}",
-                dht11_reading.temperature,
-                dht11_reading.humidity,
-                current_timestamp
-            );
-
-            println!("Sending data: {}", dht11_data);
-
-            let ds18b20_response = http_client
-                .request(Method::POST, secrets::INFLUX_HOST)
-                .await
-                .unwrap()
-                .body(dht11_data.as_bytes())
-                .headers(&[
-                    ("Authorization", secrets::INFLUX_TOKEN),
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                    ("Accept", "application/json"),
-                ])
-                .send(&mut buffer)
-                .await
-                .unwrap()
-                .status;
-
-            println!("Response status: {:?}", ds18b20_response);
-        } else {
-            log::error!("Failed to read DHT11 sensor");
-        };
+                    match request
+                        .body(data.trim_end().as_bytes())
+                        .headers(&[
+                            ("Authorization", secrets::INFLUX_TOKEN),
+                            ("Content-Type", "text/plain; charset=utf-8"),
+                            ("Accept", "application/json"),
+                        ])
+                        .send(&mut request_buffer)
+                        .await
+                    {
+                        Ok(response) => log::info!("Response status: {:?}", response.status),
+                        Err(error) => log::error!("Response error: {:?}", error),
+                    }
+                }
+                Err(error) => {
+                    log::error!("Error creating HTTP request: {:?}", error)
+                }
+            };
+        }
     }
 }
 
@@ -363,23 +438,16 @@ fn random_64() -> u64 {
 }
 
 async fn find_ds18b20(wire: &mut OneWire<Flex<'_>>, mut delay: &mut Delay) -> DS18B20 {
-    let mut first_iteration = true;
-
-    'infinite: loop {
-        // Just a little trick to prevent spam, in case we need to restart this loop
-        if !first_iteration {
-            Timer::after_millis(1000).await;
-        } else {
-            first_iteration = false;
-        }
-
+    loop {
         // Reset to test if wire is okay and if any sensor is connected
         if wire
             .reset(&mut delay)
             .inspect_err(|_| log::error!("Failed to reset wire"))
             .is_err()
         {
-            continue 'infinite;
+            Timer::after_millis(1000).await;
+
+            continue;
         }
 
         // Start searching for a sensor (we just care to get the first one)
@@ -388,10 +456,15 @@ async fn find_ds18b20(wire: &mut OneWire<Flex<'_>>, mut delay: &mut Delay) -> DS
             .search_next(&mut search, &mut delay)
             .inspect_err(|_| log::error!("Failed to search for temperature sensor"))
         else {
+            Timer::after_millis(1000).await;
+
             continue;
         };
         let Some(device) = device else {
             log::info!("No temperature sensor found");
+
+            Timer::after_millis(1000).await;
+
             continue;
         };
 
@@ -401,6 +474,8 @@ async fn find_ds18b20(wire: &mut OneWire<Flex<'_>>, mut delay: &mut Delay) -> DS
         let Ok(sensor) = DS18B20::new(device)
             .inspect_err(|_| log::error!("Failed to create temperature sensor"))
         else {
+            Timer::after_millis(1000).await;
+
             continue;
         };
 
