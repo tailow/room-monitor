@@ -331,37 +331,41 @@ async fn main(spawner: Spawner) -> ! {
 
             // SEND DATA
             if data_index >= HTTP_SEND_INTERVAL {
-                let send_future = async {
-                    log::info!("Sending data:\n{}", data_buffer.trim_end());
+                loop {
+                    let send_future = async {
+                        log::info!("Sending data:\n{}", data_buffer.trim_end());
 
-                    let mut http_client = HttpClient::new(&tcp_client, &dns_socket);
+                        let mut http_client = HttpClient::new(&tcp_client, &dns_socket);
 
-                    let response_status = http_client
-                        .request(Method::POST, secrets::INFLUX_HOST)
-                        .await?
-                        .body(data_buffer.trim_end().as_bytes())
-                        .headers(&[
-                            ("Authorization", secrets::INFLUX_TOKEN),
-                            ("Content-Type", "text/plain; charset=utf-8"),
-                            ("Accept", "application/json"),
-                        ])
-                        .send(&mut request_buffer)
-                        .await?
-                        .status;
+                        let response_status = http_client
+                            .request(Method::POST, secrets::INFLUX_HOST)
+                            .await?
+                            .body(data_buffer.trim_end().as_bytes())
+                            .headers(&[
+                                ("Authorization", secrets::INFLUX_TOKEN),
+                                ("Content-Type", "text/plain; charset=utf-8"),
+                                ("Accept", "application/json"),
+                            ])
+                            .send(&mut request_buffer)
+                            .await?
+                            .status;
 
-                    Ok::<_, reqwless::Error>(response_status)
-                };
+                        Ok::<_, reqwless::Error>(response_status)
+                    };
 
-                match embassy_time::with_timeout(Duration::from_secs(10), send_future).await {
-                    Ok(Ok(response)) => {
-                        log::info!("Response status: {:?}", response);
+                    match embassy_time::with_timeout(Duration::from_secs(10), send_future).await {
+                        Ok(Ok(response)) => {
+                            log::info!("Response status: {:?}", response);
 
-                        data_index = 0;
-                        data_buffer.clear();
-                    }
-                    Ok(Err(e)) => log::error!("HTTP Error: {:?}", e),
-                    Err(_) => {
-                        log::error!("HTTP timeout");
+                            data_index = 0;
+                            data_buffer.clear();
+
+                            break;
+                        }
+                        Ok(Err(e)) => log::error!("HTTP Error: {:?}", e),
+                        Err(_) => {
+                            log::error!("HTTP timeout");
+                        }
                     }
                 }
             }
