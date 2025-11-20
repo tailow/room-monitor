@@ -8,9 +8,11 @@
 
 mod secrets;
 
+use core::fmt::Write;
 use core::str::from_utf8;
 
 use alloc::string::String;
+
 use embassy_executor::Spawner;
 
 use embassy_net::{
@@ -37,6 +39,7 @@ use esp_radio::{
     Controller,
     wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice, WifiError, WifiEvent},
 };
+
 use esp_rtos::main;
 
 use onewire::{self, DS18B20, DeviceSearch, OneWire};
@@ -45,6 +48,7 @@ use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
     request::{Method, RequestBuilder},
 };
+
 use static_cell::StaticCell;
 
 #[panic_handler]
@@ -61,6 +65,8 @@ static WIFI_CONTROLLER: StaticCell<Controller<'static>> = StaticCell::new();
 
 pub static STOP_WIFI_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+const HTTP_SEND_INTERVAL: usize = 60;
+
 #[main]
 async fn main(spawner: Spawner) -> ! {
     loop {
@@ -73,6 +79,15 @@ async fn main(spawner: Spawner) -> ! {
         esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
 
         let timg0 = TimerGroup::new(peripherals.TIMG0);
+        let timg1 = TimerGroup::new(peripherals.TIMG1);
+
+        let mut watchdog = timg1.wdt;
+
+        watchdog.set_timeout(
+            esp_hal::timer::timg::MwdtStage::Stage0,
+            esp_hal::time::Duration::from_secs(30),
+        );
+        watchdog.enable();
 
         esp_rtos::start(timg0.timer0);
 
@@ -165,8 +180,10 @@ async fn main(spawner: Spawner) -> ! {
             Timer::after_millis(500).await;
         }
 
+        watchdog.feed();
+
         log::info!("Create TCP client");
-        let tcp_state = TcpClientState::<1, 4096, 4096>::new();
+        let tcp_state = TcpClientState::<3, 4096, 4096>::new();
         let mut tcp_client = TcpClient::new(stack, &tcp_state);
 
         tcp_client.set_timeout(Some(Duration::from_secs(5)));
@@ -247,6 +264,9 @@ async fn main(spawner: Spawner) -> ! {
             continue;
         };
 
+        let mut data_buffer: heapless::String<4096> = heapless::String::new();
+        let mut data_index = 0;
+
         let init_boot_secs = embassy_time::Instant::now().as_secs();
 
         log::info!("Seconds from boot: {}", init_boot_secs);
@@ -254,6 +274,8 @@ async fn main(spawner: Spawner) -> ! {
         internal_led.set_high();
 
         'measure: loop {
+            watchdog.feed();
+
             let Ok(_) = ds18b20
                 .measure_temperature(&mut wire, &mut delay)
                 .inspect_err(|_| log::error!("Failed to start DS18B20 temperature measurement"))
@@ -263,88 +285,86 @@ async fn main(spawner: Spawner) -> ! {
                 continue 'measure;
             };
 
-            Timer::after_secs(10).await;
+            Timer::after_secs(1).await;
 
             let current_timestamp = init_unix_timestamp + Instant::now().as_secs() - init_boot_secs;
-
-            let mut data = String::new();
 
             if let Ok(ds18b20_reading) = ds18b20.read_temperature(&mut wire, &mut delay) {
                 let (integer, fraction) = onewire::ds18b20::split_temp(ds18b20_reading);
                 let ds18b20_temperature = (integer as f32) + (fraction as f32) / 10000.0;
 
-                data.push_str(
-                    alloc::format!(
-                        "home,sensor=DS18B20 temp={} {}\n",
-                        ds18b20_temperature,
-                        current_timestamp,
-                    )
-                    .as_str(),
+                let _ = writeln!(
+                    data_buffer,
+                    "home,sensor=DS18B20 temp={} {}",
+                    ds18b20_temperature, current_timestamp
                 );
+
+                esp_println::println!(
+                    "home,sensor=DS18B20 temp={} {}",
+                    ds18b20_temperature,
+                    current_timestamp
+                );
+
+                data_index += 1;
             } else {
                 log::error!("Failed to read DS18B20 sensor");
             };
 
             if let Ok(dht11_reading) = dht11.read() {
-                data.push_str(
-                    alloc::format!(
-                        "home,sensor=DHT11 temp={},hum={} {}\n",
-                        dht11_reading.temperature,
-                        dht11_reading.humidity,
-                        current_timestamp
-                    )
-                    .as_str(),
+                let _ = writeln!(
+                    data_buffer,
+                    "home,sensor=DHT11 temp={},hum={} {}",
+                    dht11_reading.temperature, dht11_reading.humidity, current_timestamp,
                 );
+
+                esp_println::println!(
+                    "home,sensor=DHT11 temp={},hum={} {}",
+                    dht11_reading.temperature,
+                    dht11_reading.humidity,
+                    current_timestamp,
+                );
+
+                data_index += 1;
             } else {
                 log::error!("Failed to read DHT11 sensor");
             };
 
-            log::info!("Sending data:\n{}", data.trim_end());
+            // SEND DATA
+            if data_index >= HTTP_SEND_INTERVAL {
+                let send_future = async {
+                    log::info!("Sending data:\n{}", data_buffer.trim_end());
 
-            read_record_buffer = [0_u8; 16640];
-            write_record_buffer = [0_u8; 16640];
+                    let mut http_client = HttpClient::new(&tcp_client, &dns_socket);
 
-            request_buffer = [0_u8; 4096];
-
-            let seed = random_64();
-
-            let tls_config = TlsConfig::new(
-                seed,
-                &mut read_record_buffer,
-                &mut write_record_buffer,
-                TlsVerify::None,
-            );
-
-            log::info!("Create HTTP client");
-            let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
-
-            log::info!("Creating HTTP request");
-
-            match http_client
-                .request(Method::POST, secrets::INFLUX_HOST)
-                .await
-            {
-                Ok(request) => {
-                    log::info!("Sending HTTP request");
-
-                    match request
-                        .body(data.trim_end().as_bytes())
+                    let response_status = http_client
+                        .request(Method::POST, secrets::INFLUX_HOST)
+                        .await?
+                        .body(data_buffer.trim_end().as_bytes())
                         .headers(&[
                             ("Authorization", secrets::INFLUX_TOKEN),
                             ("Content-Type", "text/plain; charset=utf-8"),
                             ("Accept", "application/json"),
                         ])
                         .send(&mut request_buffer)
-                        .await
-                    {
-                        Ok(response) => log::info!("Response status: {:?}", response.status),
-                        Err(error) => log::error!("Response error: {:?}", error),
+                        .await?
+                        .status;
+
+                    Ok::<_, reqwless::Error>(response_status)
+                };
+
+                match embassy_time::with_timeout(Duration::from_secs(10), send_future).await {
+                    Ok(Ok(response)) => {
+                        log::info!("Response status: {:?}", response);
+
+                        data_index = 0;
+                        data_buffer.clear();
+                    }
+                    Ok(Err(e)) => log::error!("HTTP Error: {:?}", e),
+                    Err(_) => {
+                        log::error!("HTTP timeout");
                     }
                 }
-                Err(error) => {
-                    log::error!("Error creating HTTP request: {:?}", error)
-                }
-            };
+            }
         }
     }
 }
