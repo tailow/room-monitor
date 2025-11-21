@@ -81,6 +81,7 @@ async fn main(spawner: Spawner) -> ! {
         let timg0 = TimerGroup::new(peripherals.TIMG0);
         let timg1 = TimerGroup::new(peripherals.TIMG1);
 
+        // Set 30 second timeout for device reset
         let mut watchdog = timg1.wdt;
 
         watchdog.set_timeout(
@@ -93,7 +94,7 @@ async fn main(spawner: Spawner) -> ! {
 
         let mut internal_led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
 
-        // INIT SENSORS
+        // INIT DHT11
         let dht11_pin = Output::new(
             peripherals.GPIO4,
             Level::High,
@@ -107,6 +108,7 @@ async fn main(spawner: Spawner) -> ! {
 
         let mut dht11 = Dht11::new(dht11_pin, delay);
 
+        // INIT DS18B20
         let mut onewire_pin = Output::new(
             peripherals.GPIO25,
             Level::Low,
@@ -153,6 +155,7 @@ async fn main(spawner: Spawner) -> ! {
         let wifi_ssid = String::from(secrets::WIFI_SSID);
         let wifi_password = String::from(secrets::WIFI_PASS);
 
+        // Spawn async task for WiFi connection
         spawner.must_spawn(connection(wifi_controller, wifi_ssid, wifi_password));
         spawner.must_spawn(net_task(runner));
 
@@ -191,8 +194,6 @@ async fn main(spawner: Spawner) -> ! {
         log::info!("Create DNS socket");
         let dns_socket = DnsSocket::new(stack);
 
-        let timeserver_url = "https://io.adafruit.com/api/v2/time/seconds";
-
         let mut read_record_buffer = [0_u8; 16640];
         let mut write_record_buffer = [0_u8; 16640];
 
@@ -209,6 +210,9 @@ async fn main(spawner: Spawner) -> ! {
 
         log::info!("Create HTTP client");
         let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+
+        // Get current UNIX time
+        let timeserver_url = "https://io.adafruit.com/api/v2/time/seconds";
 
         log::info!("Create HTTP request");
         let Ok(mut time_request) = http_client
@@ -331,6 +335,7 @@ async fn main(spawner: Spawner) -> ! {
 
             // SEND DATA
             if data_index >= HTTP_SEND_INTERVAL {
+                // Loop in case of errors
                 loop {
                     let send_future = async {
                         log::info!("Sending data:\n{}", data_buffer.trim_end());
