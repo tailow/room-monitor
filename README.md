@@ -24,8 +24,8 @@ A simple ESP32 room temperature and humidity monitor, which uses Wi-Fi to send t
 
 ## Requirements
 
-- Works on Linux, Windows and OSX
-- Requires an existing [InfluxDB v2 database](https://docs.influxdata.com/influxdb/v2/) for storing data
+- Linux or Windows
+- An [InfluxDB v2 database](https://docs.influxdata.com/influxdb/v2/) for storing data
 
 ## Installation and usage
 
@@ -36,8 +36,11 @@ A simple ESP32 room temperature and humidity monitor, which uses Wi-Fi to send t
   - ``espup install``
   - On Linux and OSX, setup the [environment variables](https://github.com/esp-rs/espup?tab=readme-ov-file#environment-variables-setup):
     - ``. $HOME/export-esp.sh``
+- Install espflash: ``cargo install espflash --locked``
+- Clone the repository: ``git clone https://github.com/tailow/room-monitor.git``
 - Rename src/bin/secrets_example to secrets and add WiFi name, password, Influx token and hostname to mod.rs
-- Run ``cargo run --release`` to flash and debug
+- Connect the device with USB and run ``cargo run --release`` to flash and debug
+  - If the device doesn't connect, try holding the BOOT button when flashing, and check drivers
 
 ## Issues
 
