@@ -335,11 +335,11 @@ async fn main(spawner: Spawner) -> ! {
 
             // SEND DATA
             if data_index >= HTTP_SEND_INTERVAL {
+                log::info!("Sending data:\n{}", data_buffer.trim_end());
+
                 // Loop in case of errors
                 loop {
                     let send_future = async {
-                        log::info!("Sending data:\n{}", data_buffer.trim_end());
-
                         let mut http_client = HttpClient::new(&tcp_client, &dns_socket);
 
                         let response_status = http_client
@@ -367,7 +367,11 @@ async fn main(spawner: Spawner) -> ! {
 
                             break;
                         }
-                        Ok(Err(e)) => log::error!("HTTP Error: {:?}", e),
+                        Ok(Err(e)) => {
+                            log::error!("HTTP Error: {:?}", e);
+
+                            Timer::after_secs(1).await;
+                        }
                         Err(_) => {
                             log::error!("HTTP timeout");
                         }
