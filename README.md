@@ -22,11 +22,21 @@ A simple ESP32 room temperature and humidity monitor, which uses Wi-Fi to send t
 - embedded-dht-rs (DHT11)
 - onewire (DS18B20)
 
-## Usage
+## Requirements
 
-- Requires an existing InfluxDB v2 database
-- Install necessary Rust toolchain for ESP32
-- Rename src/bin/secrets_example to secrets and add tokens, etc. to mod.rs
+- Works on Linux, Windows and OSX
+- Requires an existing [InfluxDB v2 database](https://docs.influxdata.com/influxdb/v2/) for storing data
+
+## Installation and usage
+
+- Install Rust with [rustup](https://rustup.rs/)
+- Install the [Rust toolchain for your ESP32 device](https://docs.espressif.com/projects/rust/book/getting-started/toolchain.html)
+  - For ESP32-DevKitC v4, run:
+  - ``cargo install espup --locked``
+  - ``espup install``
+  - On Linux and OSX, setup the [environment variables](https://github.com/esp-rs/espup?tab=readme-ov-file#environment-variables-setup):
+    - ``. $HOME/export-esp.sh``
+- Rename src/bin/secrets_example to secrets and add WiFi name, password, Influx token and hostname to mod.rs
 - Run ``cargo run --release`` to flash and debug
 
 ## Issues
